@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import secrets
 import sqlite3
+import time
 
 from flask import (
     Flask,
@@ -22,6 +23,49 @@ from .validation import format_concentration, validate_csv
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
 
+def _load_or_create_secret(secret_path: str) -> bytes:
+    """读取或生成 Flask 会话密钥。
+
+    多进程共用数据目录滚动启动时，用 O_EXCL 竞争创建权：抢到者写入
+    完整密钥，其余进程等待后读取同一把密钥，避免各进程密钥不一致
+    导致会话（含操作反馈闪存消息）跨进程失效。
+    """
+    empty_since: float | None = None
+    for _ in range(200):  # 最多约 10 秒
+        try:
+            with open(secret_path, "rb") as fh:
+                key = fh.read()
+        except FileNotFoundError:
+            key = b""
+        if key:
+            return key
+        if os.path.exists(secret_path):
+            # 已存在但为空：多为其他进程刚抢到创建权、尚未写完，稍等重读；
+            # 持续为空（约 1 秒）则视为创建者崩溃的残留，删除后重新竞争。
+            if empty_since is None:
+                empty_since = time.monotonic()
+            elif time.monotonic() - empty_since > 1.0:
+                try:
+                    os.unlink(secret_path)
+                except OSError:
+                    pass
+                empty_since = None
+            time.sleep(0.05)
+            continue
+        empty_since = None
+        try:
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue  # 其他进程抢到创建权，下一轮读取它写入的密钥
+        key = secrets.token_bytes(32)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return key
+    raise RuntimeError(f"无法初始化 Flask 会话密钥文件：{secret_path}")
+
+
 def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
@@ -36,15 +80,7 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
 
     secret_path = os.path.join(data_dir, "flask_secret")
     os.makedirs(data_dir, exist_ok=True)
-    if os.path.exists(secret_path):
-        with open(secret_path, "rb") as fh:
-            app.secret_key = fh.read()
-    else:
-        key = secrets.token_bytes(32)
-        with open(secret_path, "wb") as fh:
-            fh.write(key)
-        os.chmod(secret_path, 0o600)
-        app.secret_key = key
+    app.secret_key = _load_or_create_secret(secret_path)
 
     storage = Storage(data_dir, downstream_dir)
     app.storage = storage  # 供自测脚本直接访问

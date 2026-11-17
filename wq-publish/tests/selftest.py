@@ -6,6 +6,7 @@
 3. 并发：两个页面从同一版本发起，仅一个发布成功，另一个 409 须重新预览
 4. 崩溃恢复：文件缺失、文件被改坏、遗留临时文件、游离文件、改名后未提交
 5. 撤回语义：整批替换后旧行消失；会话取消/重复发布防护
+6. 滚动启动竞态：恢复与发布互斥，不得回退已发布版本、不得清理在途临时文件
 """
 import hashlib
 import io
@@ -13,6 +14,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -169,11 +172,23 @@ reg = app3.storage.current_registry()
 check("5b 损坏文件被按登记重写",
       hashlib.sha256(open(live, "rb").read()).hexdigest() == reg["content_hash"])
 
-# 5c 遗留半写临时文件
+# 5c 遗留半写临时文件（崩溃残留：mtime 超过 60 秒宽限期）
 tmp_orphan = os.path.join(down_dir, ".tmp-publish-deadbeef.csv")
 open(tmp_orphan, "wb").write(b"partial")
+stale_ts = time.time() - 3600
+os.utime(tmp_orphan, (stale_ts, stale_ts))
 create_app(data_dir=data_dir, downstream_dir=down_dir)
-check("5c 遗留临时文件被清理", not os.path.exists(tmp_orphan))
+check("5c 崩溃遗留临时文件被清理", not os.path.exists(tmp_orphan))
+
+# 5c+ 修改时间过新的临时文件可能为他进程在途发布，不得被清理或隔离
+tmp_fresh = os.path.join(down_dir, ".tmp-publish-inflight.csv")
+open(tmp_fresh, "wb").write(b"partial")
+create_app(data_dir=data_dir, downstream_dir=down_dir)
+check("5c+ 新鲜临时文件被保留（防误删在途发布）", os.path.exists(tmp_fresh))
+check("5c+ 新鲜临时文件未被隔离",
+      not any(f.endswith(".tmp-publish-inflight.csv")
+              for f in os.listdir(os.path.join(data_dir, "quarantine"))))
+os.unlink(tmp_fresh)
 
 # 5d 下游目录出现未登记游离文件
 stranger = os.path.join(down_dir, "stranger.csv")
@@ -207,6 +222,124 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
       and app.storage.get_session(tok)["status"] == "cancelled")
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
+
+print("== 7. 滚动启动竞态：恢复与发布互斥 ==")
+# 7a 发布在「改名完成、提交之前」的窗口期，另一进程启动恢复不得回退文件
+resp = upload(client, "batch_v1.csv", "RACE-A")
+tok_race = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+reg_before = app.storage.current_registry()
+old_live_bytes = open(live, "rb").read()
+
+replaced = threading.Event()
+release = threading.Event()
+orig_atomic_write = app.storage._atomic_write
+
+
+def slow_atomic_write(csv_text):
+    orig_atomic_write(csv_text)   # 临时文件写入 + os.replace 已完成
+    replaced.set()                # 此刻：文件=新版内容，登记=旧版本
+    release.wait(15)              # 模拟提交前窗口（负载/调度停顿）
+
+
+app.storage._atomic_write = slow_atomic_write
+publish_box = {}
+
+
+def do_publish():
+    try:
+        publish_box["ok"] = app.storage.publish(tok_race)
+    except Exception as exc:  # noqa: BLE001
+        publish_box["err"] = exc
+
+
+t_pub = threading.Thread(target=do_publish, daemon=True)
+t_pub.start()
+check("7a 发布进入「改名后、提交前」窗口", replaced.wait(10))
+
+recover_done = threading.Event()
+
+
+def rolling_start():
+    create_app(data_dir=data_dir, downstream_dir=down_dir)  # 新进程启动 → recover()
+    recover_done.set()
+
+
+t_rec = threading.Thread(target=rolling_start, daemon=True)
+t_rec.start()
+time.sleep(1.0)  # 给恢复足够执行时间
+check("7a 恢复被发布写锁阻塞（未抢先执行）", not recover_done.is_set())
+check("7a 窗口期内文件未被回退", open(live, "rb").read() != old_live_bytes)
+release.set()
+t_pub.join(20)
+t_rec.join(20)
+app.storage._atomic_write = orig_atomic_write
+check("7a 发布线程无异常", "err" not in publish_box, str(publish_box.get("err")))
+check("7a 恢复最终完成", recover_done.is_set())
+reg = app.storage.current_registry()
+file_hash = hashlib.sha256(open(live, "rb").read()).hexdigest()
+check("7a 交错启动后登记与正式 CSV 一致",
+      reg["current_version"] == reg_before["current_version"] + 1
+      and file_hash == reg["content_hash"],
+      f"v={reg['current_version']} file={file_hash[:12]} reg={reg['content_hash'][:12]}")
+
+# 7b 发布在「临时文件已写、改名之前」的窗口期，恢复不得清理在途临时文件
+resp = upload(client, "batch_v2_revision.csv", "RACE-B")
+tok_race2 = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+
+real_replace = os.replace
+tmp_box = {}
+tmp_created = threading.Event()
+release2 = threading.Event()
+
+
+def blocking_replace(src, dst):
+    if os.path.basename(src).startswith(".tmp-publish-"):
+        tmp_box["path"] = src
+        tmp_created.set()
+        release2.wait(15)  # 改名前停顿：临时文件在途
+    return real_replace(src, dst)
+
+
+os.replace = blocking_replace
+publish_box2 = {}
+
+
+def do_publish2():
+    try:
+        publish_box2["ok"] = app.storage.publish(tok_race2)
+    except Exception as exc:  # noqa: BLE001
+        publish_box2["err"] = exc
+
+
+t_pub2 = threading.Thread(target=do_publish2, daemon=True)
+t_pub2.start()
+check("7b 出现在途临时文件", tmp_created.wait(10))
+tmp_inflight = tmp_box["path"]
+
+recover_done2 = threading.Event()
+
+
+def rolling_start2():
+    create_app(data_dir=data_dir, downstream_dir=down_dir)
+    recover_done2.set()
+
+
+t_rec2 = threading.Thread(target=rolling_start2, daemon=True)
+t_rec2.start()
+time.sleep(1.0)
+check("7b 在途临时文件未被恢复清理", os.path.exists(tmp_inflight))
+release2.set()
+t_pub2.join(20)
+t_rec2.join(20)
+os.replace = real_replace
+check("7b 发布线程无异常", "err" not in publish_box2, str(publish_box2.get("err")))
+reg = app.storage.current_registry()
+file_hash = hashlib.sha256(open(live, "rb").read()).hexdigest()
+check("7b 交错启动后登记与正式 CSV 一致",
+      file_hash == reg["content_hash"],
+      f"v={reg['current_version']} file={file_hash[:12]} reg={reg['content_hash'][:12]}")
+check("7b 下游目录无临时文件残留",
+      not [n for n in os.listdir(down_dir) if n.startswith(".tmp-")])
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")

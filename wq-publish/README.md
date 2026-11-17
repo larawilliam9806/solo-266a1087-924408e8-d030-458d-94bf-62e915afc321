@@ -20,11 +20,11 @@ CSV、填写批次号，系统逐行校验后预览**新增 / 修改 / 撤回（
 
 ## 本地启动
 
-环境要求：Python 3.10+（仅依赖 Flask）。
+环境要求：Python 3.10+（仅依赖 Flask；waitress 用于容器/正式部署）。
 
 ```bash
 cd wq-publish
-./run.sh                 # 自动创建 .venv、安装 flask，监听 http://127.0.0.1:5000
+./run.sh                 # 自动创建 .venv、安装依赖，监听 http://127.0.0.1:5000
 ```
 
 手动方式：
@@ -36,6 +36,25 @@ python3 -m venv --without-pip .venv   # 若系统带 ensurepip，直接 python3 
 WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
   .venv/bin/flask --app wsgi:create_app run --host 127.0.0.1 --port 5000
 ```
+
+## Docker Compose 启动（双实例演示滚动启动）
+
+```bash
+cd wq-publish
+docker compose up --build -d
+```
+
+编排包含 `web1`（http://localhost:5001）与 `web2`（http://localhost:5002）两个
+服务进程，挂载**同一组命名卷**（`wq-data` / `wq-downstream`），等价于滚动重启时
+新旧进程并存共用数据目录的场景：
+
+- 在 5001 上传并发布一个批次，5002 刷新即可看到同一登记版本与事件日志；
+- 发布过程中滚动重启另一台：`docker compose up -d --no-deps --force-recreate web2`，
+  已提交成功的发布不会被启动恢复回退，在途发布的临时文件也不会被误删；
+- 下游采集程序读取卷内 `published_results.csv`（可用
+  `docker compose exec web1 cat /app/downstream/published_results.csv` 查看）。
+
+停止并清空数据：`docker compose down -v`。
 
 环境变量（可选）：
 
@@ -67,13 +86,23 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 
 - SQLite（`data/wq_publish.db`）是版本登记与全版本结果的唯一真相源，
   发布在 `BEGIN IMMEDIATE` 事务内完成「原子换文件 → 写新版本结果 → 更新登记表」。
+- **恢复与发布互斥（多进程滚动启动安全）**：`Storage.recover()` 的整个
+  「读登记 → 核对/重建文件 → 清理残留」过程同样在 `BEGIN IMMEDIATE` 写事务内
+  执行，与发布共用同一把 SQLite 写锁。滚动启动共用数据目录的多个进程时，
+  恢复要么看到发布提交前的旧状态、要么看到提交后的新状态，绝不会把在途或
+  刚提交成功的发布回退，也不会与发布中的文件替换交错。
 - 每次启动（`Storage.recover()`）自动核对并修复：
-  1. 清理崩溃遗留的 `.tmp-publish-*` 临时文件；
+  1. 清理崩溃遗留的 `.tmp-publish-*` 临时文件；**修改时间新于 60 秒的临时文件
+     视为其他进程可能正在发布，跳过不删**（互斥锁已保证正常情况下看不到在途
+     文件，宽限期是对异常写入者的兜底）；
   2. 正式文件缺失或 SHA256 与登记不符时，以数据库登记为准原子重建；
   3. 「文件已改名但事务未提交」的现场，重启后回滚为登记中的完整版本；
-  4. 下游目录中未登记的游离文件移入 `data/quarantine/` 隔离（不直接删除）；
+  4. 下游目录中未登记的游离文件移入 `data/quarantine/` 隔离（不直接删除；
+     正式文件与 `.tmp-publish-*` 临时文件不在隔离范围）；
   5. 超过 24 小时未确认的预览会话自动作废。
   所有恢复动作写入 `event_log` 并展示在首页。
+- 多进程共用数据目录时，Flask 会话密钥以 `O_EXCL` 竞争创建、其余进程读取
+  同一把密钥，避免滚动启动期间会话（闪存消息）跨进程失效。
 
 **两个页面从同一版本发起修订，只允许一个成功**
 
@@ -89,19 +118,26 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 .venv/bin/python -I tests/selftest.py
 ```
 
-覆盖 42 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
+覆盖 55 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
 同版本双页面并发冲突（409 + obsolete + 重新预览成功）、文件缺失/损坏/临时文件/
-游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护。
+游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护，以及滚动启动竞态
+（发布「改名后、提交前」窗口期内恢复不得回退文件；在途临时文件不得被清理；
+交错启动后登记与正式 CSV 一致）。
 
 `examples/` 下提供 `batch_v1.csv`、`batch_v2_revision.csv`（含增改删）与
 `batch_invalid.csv`（含重复、负数、空值）可直接在页面上演练。
 
 ## 部署提示与已知限制
 
-- `flask run` 为开发服务器；正式环境建议用 `waitress-serve --host 127.0.0.1
-  --port 5000 wsgi:create_app`（或 gunicorn 单实例多线程）。并发正确性依赖
-  SQLite 的 `BEGIN IMMEDIATE` 文件锁与同目录 `os.replace`，多 worker 部署时
-  必须共享同一个 `WQ_DATA_DIR` 与 `WQ_DOWNSTREAM_DIR`。
+- `flask run` 为开发服务器；正式环境用容器（见 Dockerfile / docker-compose.yml）
+  或 `waitress-serve --call --host 0.0.0.0 --port 8000 wsgi:create_app`。
+  并发正确性依赖 SQLite 的 `BEGIN IMMEDIATE` 写锁与同目录 `os.replace`，
+  多进程/多实例部署时**必须共享同一个** `WQ_DATA_DIR` 与 `WQ_DOWNSTREAM_DIR`，
+  且二者需位于支持 POSIX 文件语义的本地/卷文件系统上（NFS 等网络文件系统的
+  SQLite 锁可靠性不在保障范围内）。
+- 恢复与发布互斥使用 SQLite 写锁，等待上限为 `busy_timeout`（15 秒）；
+  极端情况下若启动恢复等锁超时，进程会启动失败，由编排层（如
+  `restart: unless-stopped`）重试即可。
 - 全量结果按版本保留在 `results` 表中，当前未提供历史版本回滚的页面入口
   （数据具备，可后续增加）；历史 CSV 文件本身只保留最新一版。
 - 上传上限 16MB；认证、权限控制未包含在本版本内，建议仅监听内网或前置反向代理

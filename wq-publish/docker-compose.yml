@@ -1,0 +1,35 @@
+# 演示「多服务进程共用数据目录」的双实例编排。
+# web1 / web2 挂载同一组数据卷，等价于滚动重启时新旧进程并存：
+#   docker compose up --build -d     # 启动两个实例
+#   http://localhost:5001 / http://localhost:5002 打开同一发布台
+#   docker compose up -d --no-deps --force-recreate web2   # 模拟滚动重启其中一台
+name: wq-publish
+
+services:
+  web1:
+    build: .
+    ports:
+      - "5001:8000"
+    environment:
+      WQ_DATA_DIR: /app/data
+      WQ_DOWNSTREAM_DIR: /app/downstream
+    volumes:
+      - wq-data:/app/data
+      - wq-downstream:/app/downstream
+    restart: unless-stopped
+
+  web2:
+    build: .
+    ports:
+      - "5002:8000"
+    environment:
+      WQ_DATA_DIR: /app/data
+      WQ_DOWNSTREAM_DIR: /app/downstream
+    volumes:
+      - wq-data:/app/data
+      - wq-downstream:/app/downstream
+    restart: unless-stopped
+
+volumes:
+  wq-data:
+  wq-downstream:

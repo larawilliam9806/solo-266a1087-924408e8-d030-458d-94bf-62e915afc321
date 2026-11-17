@@ -6,8 +6,15 @@
 * 发布在单个 ``BEGIN IMMEDIATE`` 事务内完成：先写同目录临时文件并 fsync，
   再 ``os.replace`` 原子改名（下游只会看到完整的旧文件或新文件），
   最后提交事务登记新版本。
-* 提交后进程若在改名完成前崩溃：重启时按数据库登记重新生成 CSV，
-  并清理遗留临时文件；登记里不存在的游离文件会被移入 quarantine 隔离。
+* 启动恢复与发布共用同一把 SQLite 写锁（``BEGIN IMMEDIATE``）：
+  恢复的「读登记 → 核对/重建文件 → 清理残留」与发布的
+  「换文件 → 提交登记」严格互斥。多进程共用数据目录滚动启动时，
+  恢复要么看到发布提交前的旧状态、要么看到提交后的新状态，
+  绝不会把在途或刚提交成功的发布回退。
+* 清理崩溃遗留的临时文件时按 mtime 留宽限期：修改时间过新的
+  ``.tmp-publish-*`` 视为其他进程可能正在发布，跳过不删。
+* 进程若在「改名完成、提交之前」崩溃：重启时按数据库登记重建 CSV；
+  登记里不存在的游离文件会被移入 quarantine 隔离。
 """
 from __future__ import annotations
 
@@ -15,12 +22,21 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from .validation import format_concentration, render_csv
 
 LIVE_FILENAME = "published_results.csv"
+
+# 发布/恢复共用的临时文件前缀：以 . 开头且与正式文件名不同，
+# 不会被按固定文件名读取的下游采集程序读到。
+TMP_PREFIX = ".tmp-publish-"
+
+# 崩溃残留判定宽限期：修改时间新于该值的临时文件，可能是其他进程
+# 正在发布的在途文件，恢复时一律跳过不清理。
+TMP_ORPHAN_GRACE_SECONDS = 60
 
 
 class PublishConflictError(Exception):
@@ -105,22 +121,50 @@ class Storage:
 
     # ---------- 启动恢复 ----------
     def recover(self) -> list[str]:
-        """重启后核对下游文件与登记的一致性，返回本次恢复动作说明。"""
+        """重启后核对下游文件与登记的一致性，返回本次恢复动作说明。
+
+        整个恢复在 ``BEGIN IMMEDIATE`` 写事务内执行，与 publish() 互斥：
+        滚动启动共用数据目录时，本进程要么看到「发布提交前」的旧状态、
+        要么看到「提交完成后」的新状态，绝不会把在途/刚提交成功的发布回退，
+        也不会清理其他进程正在发布的临时文件。
+        """
         actions: list[str] = []
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             reg = conn.execute("SELECT * FROM registry WHERE id = 1").fetchone()
 
-            # 1) 清理崩溃遗留的临时文件（可能只写了一半，绝不能被下游读到）
+            # 1) 清理崩溃遗留的临时文件（可能只写了一半，绝不能被下游读到）。
+            #    与 publish 互斥后，此处看到的临时文件均来自已崩溃的进程；
+            #    仍按 mtime 留宽限期兜底，绝不错删其他进程正在发布的在途文件。
+            now = time.time()
             for name in os.listdir(self.downstream_dir):
-                if name.startswith(".tmp-publish-"):
-                    path = os.path.join(self.downstream_dir, name)
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                    msg = f"清理遗留临时文件 downstream/{name}"
+                if not name.startswith(TMP_PREFIX):
+                    continue
+                path = os.path.join(self.downstream_dir, name)
+                try:
+                    age = now - os.stat(path).st_mtime
+                except OSError:
+                    continue
+                if age < TMP_ORPHAN_GRACE_SECONDS:
+                    msg = (
+                        f"临时文件 downstream/{name} 修改于 {int(age)} 秒前，"
+                        "可能为其他进程正在发布，本次跳过清理"
+                    )
                     actions.append(msg)
                     self._log(conn, "recover", msg)
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue  # 已被他人清理
+                except OSError as exc:
+                    msg = f"清理遗留临时文件 downstream/{name} 失败：{exc}"
+                    actions.append(msg)
+                    self._log(conn, "recover", msg)
+                    continue
+                msg = f"清理遗留临时文件 downstream/{name}"
+                actions.append(msg)
+                self._log(conn, "recover", msg)
 
             # 2) 登记为空：正式文件（若存在）属于无登记游离文件，隔离并保留
             if reg is None:
@@ -156,10 +200,14 @@ class Storage:
                     f"启动核对通过：下游 CSV 与登记 v{reg['current_version']} 一致",
                 )
 
-            # 4) 同目录下游文件白名单：非登记文件一律隔离
+            # 4) 同目录下游文件白名单：非登记文件一律隔离。
+            #    正式文件与临时文件不在此列：临时文件由步骤 1 按宽限期处理，
+            #    此处若一并隔离会把其他进程在途的发布临时文件挪走。
             for name in os.listdir(self.downstream_dir):
+                if name == LIVE_FILENAME or name.startswith(TMP_PREFIX):
+                    continue
                 full = os.path.join(self.downstream_dir, name)
-                if os.path.isfile(full) and name != LIVE_FILENAME:
+                if os.path.isfile(full):
                     dest = self._quarantine(name)
                     msg = f"下游目录存在未登记文件 {name}，已移入 {os.path.basename(dest)}"
                     actions.append(msg)
@@ -192,9 +240,13 @@ class Storage:
         return dest
 
     def _atomic_write(self, csv_text: str) -> None:
-        """同目录临时文件 + fsync + 原子改名，保证下游只看到完整文件。"""
+        """同目录临时文件 + fsync + 原子改名，保证下游只看到完整文件。
+
+        调用方必须持有 SQLite 写锁（``BEGIN IMMEDIATE`` 事务内），
+        使临时文件从创建到改名的全过程与 recover() 互斥。
+        """
         tmp_path = os.path.join(
-            self.downstream_dir, f".tmp-publish-{uuid.uuid4().hex}.csv"
+            self.downstream_dir, f"{TMP_PREFIX}{uuid.uuid4().hex}.csv"
         )
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
@@ -342,6 +394,8 @@ class Storage:
         并发控制：BEGIN IMMEDIATE 立即拿写锁，事务内再次核对会话基线版本，
         若期间已有别人发布（current_version > base_version），本会话作废，
         抛出 PublishConflictError，调用方须重新预览。
+        写锁同时与 recover() 互斥：文件替换与登记提交对其他进程的
+        启动恢复而言是不可分割的整体。
         """
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
